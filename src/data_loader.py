@@ -41,7 +41,11 @@ class FaceEmotionDataset(Dataset):
     
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('RGB')
+        # Open PGM file and convert to RGB
+        image = Image.open(img_path)
+        # Convert to RGB if grayscale
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         label = self.labels[idx]
         
         if self.transform:
@@ -50,28 +54,42 @@ class FaceEmotionDataset(Dataset):
         return image, label
 
 def get_data_loaders(data_dir, batch_size=32, include_sunglasses=True):
-    # Define transformations
-    transform = transforms.Compose([
-        transforms.Resize((64, 64)),
+    # Define transformations for training data
+    train_transform = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225])
     ])
     
-    # Create dataset
-    dataset = FaceEmotionDataset(data_dir, transform=transform,
-                               include_sunglasses=include_sunglasses)
+    # Define transformations for validation/test data
+    val_transform = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Create datasets
+    train_dataset = FaceEmotionDataset(data_dir, transform=train_transform,
+                                     include_sunglasses=include_sunglasses)
+    test_dataset = FaceEmotionDataset(data_dir, transform=val_transform,
+                                    include_sunglasses=include_sunglasses)
     
     # Split dataset into train and test
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, test_size])
+    train_size = int(0.8 * len(train_dataset))
+    test_size = len(train_dataset) - train_size
+    train_dataset, _ = torch.utils.data.random_split(
+        train_dataset, [train_size, test_size])
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                            shuffle=True, num_workers=2)
+                            shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size,
-                           shuffle=False, num_workers=2)
+                           shuffle=False, num_workers=4, pin_memory=True)
     
     return train_loader, test_loader
