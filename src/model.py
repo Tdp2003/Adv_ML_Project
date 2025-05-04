@@ -1,116 +1,132 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch.optim as optim
+import copy
 
+# Define the EmotionNet model using a pretrained ResNet-18
 class EmotionNet(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=4):
         super(EmotionNet, self).__init__()
+        from torchvision import models
+        # load resnet
+        self.backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         
-        # Convolutional layers with batch normalization
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(256)
-        self.conv4 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(512)
-        
-        # Max pooling
-        self.pool = nn.MaxPool2d(2, 2)
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(512 * 8 * 8, 1024)  # Adjusted for 128x128 input
-        self.bn5 = nn.BatchNorm1d(1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.bn6 = nn.BatchNorm1d(512)
-        self.fc3 = nn.Linear(512, 4)  # 4 emotion classes
-        
-        # Dropout
-        self.dropout = nn.Dropout(0.5)
-        
-    def forward(self, x):
-        # Convolutional layers with LeakyReLU and pooling
-        x = self.pool(F.leaky_relu(self.bn1(self.conv1(x)), 0.1))  # 64x64
-        x = self.pool(F.leaky_relu(self.bn2(self.conv2(x)), 0.1))  # 32x32
-        x = self.pool(F.leaky_relu(self.bn3(self.conv3(x)), 0.1))  # 16x16
-        x = self.pool(F.leaky_relu(self.bn4(self.conv4(x)), 0.1))  # 8x8
-        
-        # Flatten
-        x = x.view(x.size(0), -1)  # Use batch size from input
-        
-        # Fully connected layers with dropout
-        x = F.leaky_relu(self.bn5(self.fc1(x)), 0.1)
-        x = self.dropout(x)
-        x = F.leaky_relu(self.bn6(self.fc2(x)), 0.1)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        
-        return x
+        in_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Linear(in_features, num_classes)
 
-def train_model(model, train_loader, criterion, optimizer, device, num_epochs=10):
-    model.train()
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
-    best_loss = float('inf')
-    patience = 5
-    patience_counter = 0
-    
+    def forward(self, x):
+        return self.backbone(x)
+
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, device, num_epochs):
+    """
+    Train the model with a OneCycleLR scheduler and early stopping on validation accuracy.
+    """
+    model.to(device)
+    steps_per_epoch = len(train_loader)
+    total_steps = num_epochs * steps_per_epoch
+
+    # create learning rate (One Cycle learning rate)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=optimizer.param_groups[0]['lr'],
+        total_steps=total_steps,
+        pct_start=0.3,
+        anneal_strategy='cos'
+    )
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_val_acc = 0.0
+    patience = 0
+    max_patience = 5
+
     for epoch in range(num_epochs):
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        print('-' * 10)
+
+        # train phase
+        model.train()
         running_loss = 0.0
-        correct = 0
-        total = 0
-        
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            
-            # Zero the parameter gradients
+        running_corrects = 0
+
+        for inputs, labels in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
             optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(images)
+
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
             loss = criterion(outputs, labels)
-            
-            # Backward pass and optimize
+
             loss.backward()
             optimizer.step()
             
-            # Statistics
-            running_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-        
-        epoch_loss = running_loss / len(train_loader)
-        epoch_acc = 100 * correct / total
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
-        
-        # Learning rate scheduling
-        scheduler.step(epoch_loss)
-        
-        # Early stopping
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            patience_counter = 0
+            scheduler.step()
+
+            running_loss += loss.item() * inputs.size(0)
+            running_corrects += torch.sum(preds == labels.data)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_acc = running_corrects.double() / len(train_loader.dataset)
+
+        print(f"Train loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
+
+        # evaluate model
+        model.eval()
+        val_loss = 0.0
+        val_corrects = 0
+
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item() * inputs.size(0)
+                val_corrects += torch.sum(preds == labels.data)
+
+        val_loss = val_loss / len(val_loader.dataset)
+        val_acc = val_corrects.double() / len(val_loader.dataset)
+
+        print(f"Val   loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+
+        # reference past results to checkf for improvement
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_wts = copy.deepcopy(model.state_dict())
+            patience = 0
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
+            patience += 1
+            if patience > max_patience:
                 print("Early stopping triggered")
                 break
 
-def evaluate_model(model, test_loader, device):
+    
+    model.load_state_dict(best_model_wts)
+    return model
+
+
+def evaluate(model, test_loader, device):
+    """
+    Evaluate the trained model on a test dataset.
+    """
+    model.to(device)
     model.eval()
-    correct = 0
-    total = 0
-    
+
+    running_corrects = 0
     with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    
-    accuracy = 100 * correct / total
-    print(f'Test Accuracy: {accuracy:.2f}%')
-    return accuracy
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            running_corrects += torch.sum(preds == labels.data)
+
+    test_acc = running_corrects.double() / len(test_loader.dataset)
+    print(f"Test Accuracy: {test_acc:.4f}")
+    return test_acc
